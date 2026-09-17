@@ -326,3 +326,8 @@ If `pi-cursor` is useful to you, consider [sponsoring the project on GitHub](htt
 ## License
 
 [MIT](LICENSE)
+
+## Fork 与上游同步
+
+本 fork 仓库通过 GitHub Actions（`.github/workflows/upstream-sync.yml`）每 6 小时自动检测上游 `Rahularya01/pi-cursor` 的稳定 Release。
+发现新版本后自动创建草稿 PR，经差异审阅、冲突处理和 CI 验证后按需合入。同步流程不自动合入、发布或替换安装。
