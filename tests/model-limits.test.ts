@@ -115,7 +115,9 @@ describe("bundled fallback catalog", () => {
   });
 
   it("reports the full window for the 1M Claude rows", () => {
-    const oneMillion = FALLBACK_MODELS.filter((m) => /\b1M\b/.test(m.name));
+    const oneMillion = FALLBACK_MODELS.filter(
+      (m) => /claude/i.test(m.id) && /\b1M\b/.test(m.name),
+    );
     expect(oneMillion.length).toBeGreaterThan(0);
     for (const model of oneMillion) expect(model.contextWindow).toBe(1_000_000);
   });

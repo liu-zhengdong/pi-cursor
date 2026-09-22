@@ -78,6 +78,7 @@ export interface ProcessedModel extends CursorModel {
   effortMap?: CursorEffortMap;
   rawModelByEffort?: Record<string, string>;
   rawRoutingByEffort?: Record<string, CursorModelRouting>;
+  aliases?: string[];
 }
 
 export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<string, string> {
@@ -89,6 +90,9 @@ export function buildNoReasoningEffortLookup(models: ProcessedModel[]): Map<stri
       Object.values(model.effortMap).includes("none")
     ) {
       lookup.set(model.id, "none");
+      if (model.aliases) {
+        for (const alias of model.aliases) lookup.set(alias, "none");
+      }
     }
   }
   return lookup;
@@ -141,11 +145,23 @@ export function buildRawModelLookup(
       if (defaultEffort !== undefined && !routes[""])
         routes[""] = model.rawRoutingByEffort[defaultEffort]!;
       lookup.set(model.id, routes);
+      if (model.aliases) {
+        for (const alias of model.aliases) {
+          if (!lookup.has(alias)) lookup.set(alias, routes);
+        }
+      }
       continue;
     }
 
     const routing = routingForModel(model);
-    if (routing) lookup.set(model.id, { "": routing });
+    if (routing) {
+      lookup.set(model.id, { "": routing });
+      if (model.aliases) {
+        for (const alias of model.aliases) {
+          if (!lookup.has(alias)) lookup.set(alias, { "": routing });
+        }
+      }
+    }
   }
   return lookup;
 }
@@ -206,87 +222,147 @@ export function buildEffortMap(efforts: Set<string>): CursorEffortMap {
   };
 }
 
+export function cleanDisplayName(name: string): string {
+  const cleaned = name
+    .replace(/\b(Extra High|High|Medium|Low|Max|None|Thinking|Fast)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || name;
+}
+
 /** Dedup raw models: collapse effort variants into one entry with supportsReasoningEffort. */
 export function processModels(raw: CursorModel[]): ProcessedModel[] {
-  // Group by (base, fast, thinking)
+  if (process.env.PI_CURSOR_RAW_MODELS) {
+    return raw
+      .map((model) => ({
+        ...model,
+        contextWindow: clampCursorContextWindow(model.id, model.name, model.contextWindow),
+        supportsEffort: false,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  // Group by base model ID (collapsing effort, thinking, and fast variants)
   const groups = new Map<
     string,
     {
       base: string;
-      fast: boolean;
-      thinking: boolean;
-      efforts: Map<string, CursorModel>;
+      variants: Array<{ model: CursorModel; parsed: ParsedModelId }>;
     }
   >();
 
   for (const model of raw) {
     const p = parseModelId(model.id);
-    const key = `${p.base}|${p.fast}|${p.thinking}`;
-    let g = groups.get(key);
+    let g = groups.get(p.base);
     if (!g) {
-      g = { base: p.base, fast: p.fast, thinking: p.thinking, efforts: new Map() };
-      groups.set(key, g);
+      g = {
+        base: p.base,
+        variants: [],
+      };
+      groups.set(p.base, g);
     }
-    g.efforts.set(p.effort, model);
+    g.variants.push({ model, parsed: p });
   }
 
   const result: ProcessedModel[] = [];
 
   for (const g of groups.values()) {
-    const effortNames = new Set(g.efforts.keys());
+    // Pick the best representative variant (prefer clean/medium/standard)
+    const sorted = [...g.variants].sort((a, b) => {
+      const score = (v: typeof a) => {
+        let s = 0;
+        if (!v.parsed.fast) s += 10;
+        if (!v.parsed.thinking) s += 5;
+        if (v.parsed.effort === "" || v.parsed.effort === "medium") s += 3;
+        return s;
+      };
+      return score(b) - score(a);
+    });
+    const repVariant = sorted[0]!;
+    const rep = repVariant.model;
+    const id = g.base;
+    const name = cleanDisplayName(rep.name);
 
-    // Dedup when there are multiple effort variants, OR a single variant
-    // whose effort is non-empty (e.g. claude-4.5-opus-high — strip the
-    // mandatory effort suffix so the model appears as claude-4.5-opus
-    // with effort mapping).
-    const hasOnlyEffortVariants = effortNames.size === 1 && ![...effortNames][0]!.trim().length;
-    const shouldDedup = effortNames.size >= 2 || !hasOnlyEffortVariants;
-    if (shouldDedup && (effortNames.size >= 2 || [...effortNames][0] !== "")) {
-      // Pick representative: prefer "medium" or default ("") for name/metadata
-      const rep = g.efforts.get("medium") ?? g.efforts.get("") ?? [...g.efforts.values()][0]!;
+    // Collect effort levels and reasoning support
+    const effortNames = new Set<string>();
+    let hasThinking = false;
+    for (const v of g.variants) {
+      if (v.parsed.effort) effortNames.add(v.parsed.effort);
+      if (v.parsed.thinking || v.model.reasoning) hasThinking = true;
+    }
 
-      // Build deduped model ID: base + thinking/fast suffix (no effort)
-      let id = g.base;
-      if (g.thinking) id += "-thinking";
-      if (g.fast) id += "-fast";
+    const isKnownReasoning = supportsReasoningModelId(id);
+    const supportsEffort = effortNames.size > 0 || hasThinking || isKnownReasoning;
 
-      const effortMap = buildEffortMap(effortNames);
-      const rawModelByEffort = Object.fromEntries(
-        [...g.efforts.entries()].map(([effort, model]) => [effort, model.id]),
-      );
-      const rawRoutingByEffort = Object.fromEntries(
-        [...g.efforts.entries()].map(([effort, model]) => [
-          effort,
-          {
-            modelId: model.requestedModelId ?? model.id,
-            ...(model.parameters?.length ? { parameters: model.parameters } : {}),
-            ...(model.requiresMaxMode ? { requiresMaxMode: true } : {}),
-            ...(typeof model.requestedMaxMode === "boolean"
-              ? { requestedMaxMode: model.requestedMaxMode }
-              : {}),
-          },
-        ]),
-      );
-
-      result.push({
-        ...rep,
-        id,
-        contextWindow: clampCursorContextWindow(id, rep.name, rep.contextWindow),
-        supportsEffort: true,
-        effortMap,
-        rawModelByEffort,
-        rawRoutingByEffort,
-      });
-    } else {
-      // Keep single entries as-is (base model without effort variants)
-      for (const model of g.efforts.values()) {
-        result.push({
-          ...model,
-          contextWindow: clampCursorContextWindow(model.id, model.name, model.contextWindow),
-          supportsEffort: false,
-        });
+    let effortMap: CursorEffortMap | undefined;
+    if (supportsEffort) {
+      effortMap = buildEffortMap(effortNames);
+      // For models that support thinking but only offer a binary -thinking variant:
+      if (hasThinking && effortNames.size === 0) {
+        effortMap.off = "none";
+        effortMap.low = "low";
+        effortMap.medium = "medium";
+        effortMap.high = "high";
       }
     }
+
+    const rawModelByEffort: Record<string, string> = {};
+    const rawRoutingByEffort: Record<string, CursorModelRouting> = {};
+
+    for (const v of g.variants) {
+      const routing = routingForModel(v.model) ?? { modelId: v.model.id };
+      if (v.parsed.effort) {
+        rawModelByEffort[v.parsed.effort] = v.model.id;
+        rawRoutingByEffort[v.parsed.effort] = routing;
+      }
+      if (v.parsed.thinking) {
+        for (const lvl of ["high", "medium", "max", "xhigh"]) {
+          if (!rawRoutingByEffort[lvl]) {
+            rawModelByEffort[lvl] = v.model.id;
+            rawRoutingByEffort[lvl] = routing;
+          }
+        }
+      } else if (!v.parsed.fast) {
+        for (const lvl of ["", "none", "off", "low"]) {
+          if (!rawRoutingByEffort[lvl]) {
+            rawModelByEffort[lvl] = v.model.id;
+            rawRoutingByEffort[lvl] = routing;
+          }
+        }
+      }
+    }
+
+    if (!rawRoutingByEffort[""]) {
+      rawRoutingByEffort[""] = routingForModel(rep) ?? { modelId: rep.id };
+      rawModelByEffort[""] = rep.id;
+    }
+
+    // Collect aliases for seamless backward compatibility
+    const aliases = new Set<string>();
+    for (const v of g.variants) {
+      if (v.model.id !== id) aliases.add(v.model.id);
+    }
+    // Automatically support standard variant aliases (e.g. <base>-thinking, <base>-fast)
+    if (supportsEffort) {
+      aliases.add(`${id}-thinking`);
+    }
+    aliases.add(`${id}-fast`);
+    if (supportsEffort) {
+      aliases.add(`${id}-fast-thinking`);
+      aliases.add(`${id}-thinking-fast`);
+    }
+
+    result.push({
+      ...rep,
+      id,
+      name,
+      contextWindow: clampCursorContextWindow(id, name, rep.contextWindow),
+      supportsEffort,
+      effortMap,
+      rawModelByEffort,
+      rawRoutingByEffort,
+      aliases: aliases.size > 0 ? [...aliases] : undefined,
+    });
   }
 
   return result.sort((a, b) => a.id.localeCompare(b.id));

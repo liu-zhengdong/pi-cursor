@@ -11,5 +11,6 @@ export default defineConfig({
   dts: false,
   splitting: false,
   treeshake: true,
+  removeNodeProtocol: false,
   external: ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@bufbuild/protobuf"],
 });
